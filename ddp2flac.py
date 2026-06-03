@@ -4,7 +4,7 @@
 Looks in the current directory for DDP sets, including those inside ZIP
 archives (with support for nested ZIPs). For every DDP found, splits the
 raw CD image into individual FLAC files, using PQDESCR to get track
-boundaries and CDTEXT.BIN to get disc-level album/artist.
+boundaries and CDTEXT.BIN (if present) to get disc-level album/artist.
 
 All FLACs are written into a single ./flacs directory next to the script.
 Filenames follow the pattern:
@@ -14,6 +14,22 @@ Filenames follow the pattern:
 where <label> comes from the nearest enclosing ZIP name (or the DDP
 folder name if there is no ZIP). If a filename already exists, _2, _3,
 ... are appended to avoid overwriting.
+
+Typical usage:
+    - Put this script in a folder that contains student ZIPs and/or
+      unpacked DDP folders.
+    - Run:  python3 ddp2flacs.py
+    - Look in ./flacs for the resulting FLAC files.
+
+Key assumptions:
+    * DDP directories contain:
+        - a file named "DDPID" (case-insensitive), and
+        - an audio image named AUDIO.DAT or IMAGE.DAT (16-bit, 44.1 kHz,
+          stereo, little-endian, CD sector layout 2352 bytes/frame).
+    * Track boundaries are defined in PQDESCR / PQDESCR.DAT as fixed
+      64-byte records in the format you provided.
+    * CDTEXT.BIN, if present, contains standard CD-Text pack data; here
+      we only read disc TITLE (album) and PERFORMER (artist).
 
 (C) John Warburton 2026, GNU Public Licence v. 3 applies.
 """
@@ -32,17 +48,23 @@ from typing import Dict, List, Optional
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Root folder to scan (current directory)
+# Root folder to scan. Changing this lets you point the script somewhere
+# else, but in typical use you just run the script in the folder that
+# contains ZIPs / DDPs and leave this as "./".
 DDP_ROOT = Path("./")
 
-# Where extracted FLACs will be written (single shared folder)
+# Where extracted FLACs will be written.
+# NOTE: For this recursive version we use a *single* shared folder rather
+# than one subfolder per DDP. Filenames are prefixed with a label derived
+# from ZIP/DDP context, and uniqueness is enforced.
 OUTPUT_ROOT = Path("./flacs")
 
-# Where ZIP contents will be extracted (remove after use)
+# Where ZIP contents will be extracted. If you want to clean up after
+# processing, you can safely delete this folder.
 EXTRACT_ROOT = Path("./_extracted")
 
-# Path to the FLAC encoder binary (can be just "flac" if on PATH)
-# You might need to install this binary from a suitable source.
+# Path to the FLAC encoder binary (can be just "flac" if on PATH).
+# On Windows, you might use "flac.exe"; on macOS/Linux just "flac".
 FLAC_BIN = "flac"
 
 # ---------------------------------------------------------------------------
@@ -54,12 +76,21 @@ class TrackInfo:
     """Represents one CD track as defined by the DDP PQ / CD-Text.
 
     All positions are expressed relative to the start of the disc.
-    `start_frames` and `end_frames` are in CD frames (75 frames per second).
+    `start_frames` and `end_frames` are in CD frames (75 frames/second).
+
+    Fields:
+        number        : Track number (1-based, as on the CD).
+        start_frames  : INDEX 01 position from disc start, in frames.
+        end_frames    : Start of the next track, or lead-out, in frames.
+        title         : Track title (unused for now, we set generic "Track nn").
+        artist        : Track artist/performer (disc-level from CD-Text).
+        album         : Album title (disc-level from CD-Text).
+        isrc          : ISRC code if available (not populated here).
     """
 
     number: int
-    start_frames: int  # CD frames from disc start (INDEX 01 position)
-    end_frames: int    # CD frames from disc start (start of next track or lead-out)
+    start_frames: int
+    end_frames: int
 
     title: Optional[str] = None
     artist: Optional[str] = None
@@ -67,6 +98,8 @@ class TrackInfo:
     isrc: Optional[str] = None
 
     def duration_frames(self) -> int:
+        """Return track duration in CD frames (end_frames - start_frames)."""
+
         return self.end_frames - self.start_frames
 
 
@@ -74,6 +107,7 @@ class TrackInfo:
 # CD time helpers (MSF <-> frames / seconds)
 # ---------------------------------------------------------------------------
 
+# Constants for standard audio CD format.
 CD_FRAMES_PER_SECOND = 75
 BYTES_PER_CD_FRAME = 2352  # 588 stereo samples * 4 bytes/sample
 SAMPLE_RATE = 44100
@@ -85,19 +119,29 @@ def msf_to_frames(m: int, s: int, f: int) -> int:
     """Convert MM:SS:FF (75 fps) to absolute CD frames.
 
     frames = ((M * 60) + S) * 75 + F
+
+    Used when parsing PQDESCR MMSSFF timestamps.
     """
 
     return (m * 60 + s) * CD_FRAMES_PER_SECOND + f
 
 
 def frames_to_seconds(frames: int) -> float:
-    """Convert CD frames to seconds (float)."""
+    """Convert CD frames to seconds (float).
+
+    Not used directly for FLAC timing here (we work in frames -> centiseconds),
+    but kept for completeness.
+    """
 
     return frames / float(CD_FRAMES_PER_SECOND)
 
 
 def frames_to_byte_offset(frames: int) -> int:
-    """Byte offset into the raw audio image for a given CD frame index."""
+    """Byte offset into the raw audio image for a given CD frame index.
+
+    Not used in this script because we let FLAC do the slicing, but useful
+    if you ever want to read/write raw PCM slices yourself.
+    """
 
     return frames * BYTES_PER_CD_FRAME
 
@@ -107,20 +151,29 @@ def frames_to_byte_offset(frames: int) -> int:
 # ---------------------------------------------------------------------------
 
 def safe_filename_component(text: str) -> str:
-    """Make a string safe for use as part of a filename."""
-    # Remove NULs just in case
+    """Sanitise a string for use as part of a filename.
+
+    - Removes NULs.
+    - Collapses whitespace to single spaces.
+    - Replaces characters outside [letters, digits, space, _, -, ., ()]
+      with underscores.
+
+    Use this for labels (e.g. ZIP/DDP names) and album titles before
+    embedding them in filenames.
+    """
+
     text = text.replace("\x00", "")
-    # Collapse whitespace
     text = " ".join(text.split())
-    # Replace problematic chars (keep letters, digits, space, _, -, ., parentheses)
     return re.sub(r"[^\w\s\-\.\(\)]", "_", text)
 
 
 def unique_out_path(directory: Path, filename: str) -> Path:
     """Return a unique output path in `directory` for `filename`.
 
-    If `directory/filename` exists, append _2, _3, ... before the suffix.
+    If `directory/filename` exists, append "_2", "_3", ... before the
+    suffix to avoid overwriting.
     """
+
     directory.mkdir(parents=True, exist_ok=True)
     base_path = directory / filename
     if not base_path.exists():
@@ -141,7 +194,16 @@ def unique_out_path(directory: Path, filename: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def looks_like_ddp(ddp_dir: Path) -> bool:
-    """Heuristic: a DDP directory contains DDPID and AUDIO.DAT or IMAGE.DAT."""
+    """Heuristic: does `ddp_dir` look like a DDP set?
+
+    We consider a directory to be a DDP set if:
+        - It is a directory; and
+        - It contains a file named "DDPID" (any case); and
+        - It contains an audio image named "AUDIO.DAT" or "IMAGE.DAT".
+
+    This matches the typical structure of DDP masters produced by common
+    authoring tools.
+    """
 
     if not ddp_dir.is_dir():
         return False
@@ -153,7 +215,11 @@ def looks_like_ddp(ddp_dir: Path) -> bool:
 
 
 def locate_audio_file(ddp_dir: Path) -> Path:
-    """Find the raw 16-bit 44.1 kHz stereo audio file inside a DDP directory."""
+    """Find the raw 16-bit 44.1 kHz stereo audio file inside a DDP directory.
+
+    We look for AUDIO.DAT first, then IMAGE.DAT. Adjust this if your
+    authoring software uses different names.
+    """
 
     candidates = ["AUDIO.DAT", "IMAGE.DAT"]
 
@@ -174,10 +240,10 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
 
     PQDESCR is treated as fixed-size 64-byte records. Each relevant record:
 
-      0-3   : b"VVVS"
+      0-3   : b"VVVS"                       (magic)
       4-5   : track code (ASCII)   e.g. "00", "01", ..., "99", "AA" (lead-out)
       6-7   : index code (ASCII)   e.g. "00", "01"
-      8-9   : b"  "
+      8-9   : b"  " (two spaces)
       10-15 : time "MMSSFF" (ASCII) minutes / seconds / frames @ 75 fps
       16-17 : flag/constant (ignored)
       18-63 : padding (ignored)
@@ -190,7 +256,7 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
       * index "00"         : INDEX 00 (pregap) – currently ignored.
 
     Returns TrackInfo objects with only number/start/end populated; title/
-    artist/album/isrc are left as None for now.
+    artist/album/isrc are left for CD-Text or other metadata sources.
     """
 
     # Locate PQDESCR (try a few common variants)
@@ -213,16 +279,14 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
 
     data = pq_path.read_bytes()
 
-    # Some implementations appear to terminate the file with CRLF. If that
-    # makes the length divisible by 64, strip it so we have whole records.
+    # Some implementations terminate with CRLF. If stripping CRLF leaves an
+    # exact multiple of 64-byte records, drop it so we parse whole records.
     if len(data) >= 2 and data[-2:] == b"\r\n" and (len(data) - 2) % 64 == 0:
         data = data[:-2]
 
     RECORD_SIZE = 64
-    if len(data) % RECORD_SIZE not in (0,):
-        # Not an exact multiple of 64; we'll still parse the complete records
-        # and ignore any trailing partial bytes.
-        pass
+    # If the file is not an exact multiple of 64, we still parse all full
+    # records and silently ignore trailing bytes.
 
     track_entries: List[tuple[int, int]] = []  # (track_number, start_frames)
     lead_out_frames: Optional[int] = None
@@ -234,9 +298,11 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
         rec = data[offset : offset + RECORD_SIZE]
 
         if len(rec) < 18:
+            # Too short to contain required fields; skip
             continue
 
         if rec[0:4] != b"VVVS":
+            # Not a PQ timing record
             continue
 
         try:
@@ -244,9 +310,11 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
             index_code = rec[6:8].decode("ascii", errors="strict")
             time_str = rec[10:16].decode("ascii", errors="strict")
         except UnicodeDecodeError:
+            # Skip malformed records
             continue
 
         if len(time_str) != 6 or not time_str.isdigit():
+            # Unexpected time format
             continue
 
         mm = int(time_str[0:2])
@@ -257,6 +325,7 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
 
         # Lead-out: track AA, index 01
         if track_code == "AA" and index_code == "01":
+            # Use the earliest AA01 we see as lead-out
             if lead_out_frames is None or frames < lead_out_frames:
                 lead_out_frames = frames
             continue
@@ -278,7 +347,7 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
     if not track_entries:
         raise ValueError(f"No track INDEX 01 entries found in {pq_path}")
 
-    # Sort entries by their frame position (start time), not just track number,
+    # Sort entries by frame position (start time), not just track number,
     # in case of non-sequential or hidden tracks.
     track_entries.sort(key=lambda tf: tf[1])
 
@@ -318,7 +387,12 @@ def parse_pq(ddp_dir: Path) -> List["TrackInfo"]:
 # ---------------------------------------------------------------------------
 
 def _read_cdtext_packs(cdtext_path: Path) -> List[bytes]:
-    """Read CDTEXT.BIN and return a list of 18-byte CD-Text packs."""
+    """Read CDTEXT.BIN and return a list of raw 18-byte CD-Text packs.
+
+    We do not validate CRCs here; for our purposes it's enough to split
+    the file into packs and use the payload bytes.
+    """
+
     data = cdtext_path.read_bytes()
 
     PACK_SIZE = 18
@@ -342,6 +416,9 @@ def _collect_cdtext_strings(packs: List[bytes]) -> Dict[tuple[int, int], str]:
       * In each pack, only keep bytes up to the first NUL (0x00).
       * Ignore character-position inheritance and multi-string-per-pack
         rules for now.
+
+    This is enough to retrieve the disc TITLE and PERFORMER cleanly in
+    your example, but not robust enough for all CD-Text encodings.
     """
 
     # (pack_type, track) -> list of payload byte chunks (in file order)
@@ -380,6 +457,10 @@ def apply_cdtext_metadata(ddp_dir: Path, tracks: List["TrackInfo"]) -> None:
     For now we only use disc-level info:
       - ALBUM from disc TITLE (type 0x80, track 0)
       - ARTIST from disc PERFORMER (type 0x81, track 0), if present
+
+    All tracks from the same DDP are given the same album and artist.
+    Track titles remain generic ("Track nn") until/unless a more
+    sophisticated CD-Text track-title parser is implemented.
     """
 
     cdtext_candidates = ["CDTEXT.BIN", "cdtext.bin"]
@@ -416,9 +497,11 @@ def apply_cdtext_metadata(ddp_dir: Path, tracks: List["TrackInfo"]) -> None:
 def _frames_to_flac_time(frames: int) -> str:
     """Convert CD frames (75 fps) to a flac mm:ss.ss time string.
 
-    We work in integer centiseconds and floor, so the resulting time
-    is always <= the true position, avoiding 'after end of input' errors.
+    We work in integer centiseconds and floor, so the resulting time is
+    always <= the true position, avoiding 'after end of input' errors
+    for the last track.
     """
+
     if frames < 0:
         frames = 0
 
@@ -436,9 +519,19 @@ def _frames_to_flac_time(frames: int) -> str:
 def build_flac_command(audio_path: Path, track: TrackInfo, out_path: Path) -> List[str]:
     """Construct the command-line for FLAC to encode a single track.
 
-    Input: raw PCM, 16-bit, 44.1 kHz, stereo, little-endian.
-    We use --skip (absolute, from disc start) and --until=+... (relative
-    to skip), with times derived directly from CD frames.
+    Input is raw PCM:
+        - 16-bit
+        - 44.1 kHz
+        - stereo
+        - little-endian
+
+    We call flac with:
+        --force-raw-format --endian=little --sign=signed
+        --channels=2 --bps=16 --sample-rate=44100
+        --skip=mm:ss.ss --until=+mm:ss.ss
+
+    `--skip` is the offset from the start of the raw image;
+    `--until=+...` is the duration relative to that offset.
     """
 
     start_frames = track.start_frames
@@ -469,7 +562,7 @@ def build_flac_command(audio_path: Path, track: TrackInfo, out_path: Path) -> Li
         str(audio_path),
     ]
 
-    # Attach tags if available
+    # Attach tags if available. If no title, use a generic "Track NN".
     tag_args: List[str] = []
     if track.title:
         tag_args.append(f"--tag=TITLE={track.title}")
@@ -482,7 +575,7 @@ def build_flac_command(audio_path: Path, track: TrackInfo, out_path: Path) -> Li
     if track.isrc:
         tag_args.append(f"--tag=ISRC={track.isrc}")
 
-    # Insert tag arguments just before "-o"
+    # Insert tag arguments just before "-o" so they are applied to this file.
     cmd[8:8] = tag_args
 
     return cmd
@@ -491,8 +584,9 @@ def build_flac_command(audio_path: Path, track: TrackInfo, out_path: Path) -> Li
 def extract_track(audio_path: Path, track: TrackInfo, label: str) -> None:
     """Run FLAC to encode one track from the raw DDP audio image.
 
-    Filenames follow: <label>_Track_NN.flac, with label derived from
-    ZIP/DDP context, and uniqueness enforced.
+    Filenames follow: <label>_Track_NN.flac, with `label` derived from
+    ZIP/DDP context (or album name if label is empty), and uniqueness
+    enforced by `unique_out_path`.
     """
 
     label_component = safe_filename_component(label or track.album or "Unknown")
@@ -514,7 +608,12 @@ def extract_track(audio_path: Path, track: TrackInfo, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 def process_ddp_set(ddp_dir: Path, label: str) -> None:
-    """Process a single DDP directory: parse PQ, then extract all tracks."""
+    """Process a single DDP directory: parse PQ, then extract all tracks.
+
+    `label` is used as the filename prefix for all tracks from this DDP.
+    It is typically derived from the nearest enclosing ZIP name, or falls
+    back to the DDP directory name.
+    """
 
     print(f"Processing DDP: {ddp_dir} (label: {label})")
 
@@ -539,10 +638,17 @@ def process_ddp_set(ddp_dir: Path, label: str) -> None:
 def walk_and_process(root: Path, label_prefix: Optional[str] = None) -> None:
     """Recursively scan `root` for DDP sets and ZIPs.
 
-    * If a directory looks like a DDP, process it with the current label prefix
-      (or the directory name if no prefix).
-    * If a ZIP file is found, extract it under EXTRACT_ROOT and recurse into it
-      with an updated label prefix incorporating the ZIP's stem.
+    Behaviour:
+      * If a directory looks like a DDP, process it with the current
+        `label_prefix` (or the directory name if `label_prefix` is None).
+      * If a ZIP file is found, extract it under EXTRACT_ROOT and recurse
+        into it with an updated label prefix incorporating the ZIP's stem.
+      * For ordinary directories that are not DDPs, recurse into them with
+        the same `label_prefix`.
+
+    This effectively walks nested ZIP trees and applies `process_ddp_set`
+    to every DDP it finds, building a label that reflects the ZIP nesting
+    (e.g. OuterZip_InnerZip_Track_01.flac).
     """
 
     for entry in root.iterdir():
@@ -552,12 +658,15 @@ def walk_and_process(root: Path, label_prefix: Optional[str] = None) -> None:
 
         if entry.is_dir():
             if looks_like_ddp(entry):
+                # Use the label prefix if available, otherwise the directory name
                 ddp_label = label_prefix or entry.name
                 process_ddp_set(entry, ddp_label)
             else:
+                # Recurse into non-DDP directories without changing the label
                 walk_and_process(entry, label_prefix)
 
         elif entry.is_file() and entry.suffix.lower() == ".zip":
+            # Found a ZIP: build a new label prefix and extract it
             zip_label = entry.stem
             new_label_prefix = f"{label_prefix}_{zip_label}" if label_prefix else zip_label
 
@@ -575,6 +684,7 @@ def walk_and_process(root: Path, label_prefix: Optional[str] = None) -> None:
             with zipfile.ZipFile(entry, "r") as zf:
                 zf.extractall(extract_dir)
 
+            # Now scan inside the extracted ZIP, carrying the new label
             walk_and_process(extract_dir, new_label_prefix)
 
 
@@ -583,6 +693,19 @@ def walk_and_process(root: Path, label_prefix: Optional[str] = None) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Entry point: prepare folders and kick off recursive scan.
+
+    You normally just run this script from a shell:
+
+        python3 ddp2flacs.py
+
+    It will:
+      * Create ./flacs and ./_extracted if needed.
+      * Scan DDP_ROOT (default: current directory) recursively.
+      * Extract nested ZIPs as needed.
+      * Convert every DDP it finds into FLAC tracks.
+    """
+
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
 
